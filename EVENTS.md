@@ -339,9 +339,46 @@ into no-ops.
 **The run.** Run `npm run demo:failure` and paste what the delivery left
 behind (the ledger, the provider, and the dead-letter list).
 
+```
+> campus-reservations@1.0.0 demo:failure
+> tsx src/demos/failureDemo.ts
+
+armed: call 1 to the payment provider will throw
+booked bk-1001 for 8500 cents
+cancelled bk-1001, refund 8500 cents, refund message msg-3
+the cancel call itself returned: booking is cancelled
+
+=== after the failed delivery ===
+ledger entries: 1
+  led-1 bk-1001 $85.00 (cancelled more than two hours ahead)
+gateway calls: 1
+gateway settlements: 0
+money returned in total: $0.00
+dead letters: 1
+  msg-3 refund.requested attempt 1 in RefundLedger: payment provider did not answer on call 1 for bk-1001
+    failedAtMinute: 480
+    payload: {"bookingId":"bk-1001","organizer":"H. Ahmad","organizerEmail":"hahmad@example.edu","amountCents":8500,"reason":"cancelled more than two hours ahead","requestedAtMinute":480}
+
+=== bus log ===
+  msg-1 booking.confirmed deliveries=1
+  msg-2 booking.cancelled deliveries=1
+  msg-3 refund.requested deliveries=1
+
+the refund message is in the log and in the dead-letter list. Milestone 3 asks what you do with it.
+```
+
 ### Your recovery
 
-**What, if anything, the failed delivery left undone.**
+**What, if anything, the failed delivery left undone.** The money. The
+handler got halfway: it wrote `led-1` ($85.00) to the ledger, then
+`gateway.refund` threw on call 1 before anything settled. The ledger now
+says $85.00 was refunded while the provider has 0 settlements and $0.00
+returned, and the two disagree by $85.00. Everything outside the refund
+finished: `cancel()` returned with the booking `cancelled`, and the
+`booking.cancelled` subscribers (mail, reminder, stats) ran normally. The
+caller never saw the failure, because `publish` does not throw. The only
+trace is the dead letter for `msg-3`, attempt 1, in `RefundLedger`. Nothing
+retries on its own, so the organizer stays unpaid until someone acts.
 
 **The option you took and its evidence.** If you redelivered the
 message, paste the state after the redelivery and the bus log line for that
@@ -349,8 +386,66 @@ message. If you left the message for a person to handle, write the runbook line
 they would follow, and name which fields of the dead-lettered message they read to
 follow it and what each one tells them.
 
+**Option taken: redeliver.** At the end of `main()` in
+`src/demos/failureDemo.ts` I added a guarded
+`app.bus.redeliver(cancellation.refundMessageId)`, followed by
+`printRefundState` and `printMessageLog`. `npm run typecheck` is still
+green and 36/36 tests pass. The state after the redelivery:
+
+```
+redelivering msg-3
+
+=== after redelivering the refund message ===
+ledger entries: 1
+  led-1 bk-1001 $85.00 (cancelled more than two hours ahead)
+gateway calls: 2
+gateway settlements: 1
+  stl-1 bk-1001 $85.00
+money returned in total: $85.00
+dead letters: 1
+  msg-3 refund.requested attempt 1 in RefundLedger: payment provider did not answer on call 1 for bk-1001
+    failedAtMinute: 480
+    payload: {"bookingId":"bk-1001","organizer":"H. Ahmad","organizerEmail":"hahmad@example.edu","amountCents":8500,"reason":"cancelled more than two hours ahead","requestedAtMinute":480}
+```
+
+The bus log line for the refund message:
+
+```
+  msg-3 refund.requested deliveries=2
+```
+
+Delivery 2 of `msg-3` finished what delivery 1 left undone:
+- The ledger was **not** written again. It is still one entry, `led-1`,
+  because the message id was already in the "recorded" set.
+- The payment **was** made: gateway call 2 produced `stl-1`, $85.00, because
+  the id was not in the "settled" set.
+- Ledger total = settled total = $85.00, and no new dead letter appeared.
+
+The old dead letter is still listed, because the list is a log, not a queue,
+and `redeliver` removes nothing from it. "Resolved" therefore has to be read
+from the provider and the delivery count, not from the dead-letter list.
+
+This redelivery is safe only because of the milestone 2 fix:
+- With the original handler it would have written `led-2`. The ledger would
+  say $170.00 refunded while $85.00 was paid.
+- With a single "seen this message id, skip" check it would have skipped the
+  whole handler. The organizer would never be paid, and the ledger would
+  still claim $85.00.
+
 ### The other option
 
 **What the option you did not take would have cost.** One line, in terms of who
 does the work, when the organizer gets their money, and what has to be true for
 it to be safe.
+
+Leaving it for triage would have cost the following:
+- **Who does the work:** a person. They read the dead letter's `message.id`,
+  `payload.bookingId` and `amountCents`, `subscriberName`, `reason`, and
+  `attempt`, check the provider for a settlement on `bk-1001`, and only then
+  redeliver or refund by hand.
+- **When the organizer gets the $85.00:** whenever someone gets to the list,
+  hours or a business day later instead of immediately.
+- **What it buys in return:** it is safe even without an idempotent handler
+  or a healed provider, because a human confirms nothing settled before any
+  money moves. That is also the one case my fix cannot see: a provider that
+  settled and then failed to answer.
